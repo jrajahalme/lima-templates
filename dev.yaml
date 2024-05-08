@@ -1,0 +1,178 @@
+vmType: "vz"
+rosetta:
+  # Enable Rosetta for Linux.
+  # Hint: try `softwareupdate --install-rosetta` if Lima gets stuck at `Installing rosetta...`
+  enabled: true
+  # Register rosetta to /proc/sys/fs/binfmt_misc
+  binfmt: true
+images:
+- location: "https://cloud-images.ubuntu.com/releases/22.04/release/ubuntu-22.04-server-cloudimg-amd64.img"
+  arch: "x86_64"
+- location: "https://cloud-images.ubuntu.com/releases/22.04/release/ubuntu-22.04-server-cloudimg-arm64.img"
+  arch: "aarch64"
+
+cpus: 12
+memory: "20GiB"
+
+#
+# - This must be in /etc/bootptab on the host:
+#
+# # bootptab
+# %%
+# # hostname	hwtype	hwaddr			ipaddr		bootfile
+# dev		1	de:ad:be:ef:00:01	192.168.105.101
+#
+# - socket_vmnet must be installed:
+#   `brew install socket_vmnet`
+#
+# - `~/.lima/_config/networks.yaml` must be adjusted:
+#    paths.socketVMNet: from `realpath /opt/homebrew/opt/socket_vmnet/bin/socket_vmnet`
+#    networks.shared.dhcpEnd: 192.168.105.100
+#
+# - sudoers must be updated:
+#   `limactl sudoers | sudo tee /etc/sudoers.d/lima`
+
+networks:
+  - lima: user-v2
+  - lima: shared
+    macAddress: de:ad:be:ef:00:01
+
+mounts:
+- location: "~/dev"
+  mountPoint: "/home/jarnor.linux/go/src/github.com"
+  writable: true
+# Bazel does not work with the mounted cache
+#- location: "~/dev.cache"
+#  mountPoint: "/home/jarnor.linux/.cache"
+#  writable: true
+- location: "/tmp/lima"
+  writable: true
+mountType: "virtiofs"
+
+# containerd is managed by Docker, not by Lima, so the values are set to false here.
+containerd:
+  system: false
+  user: false
+provision:
+- mode: system
+  # This script defines the host.docker.internal hostname when hostResolver is disabled.
+  # It is also needed for lima 0.8.2 and earlier, which does not support hostResolver.hosts.
+  # Names defined in /etc/hosts inside the VM are not resolved inside containers when
+  # using the hostResolver; use hostResolver.hosts instead (requires lima 0.8.3 or later).
+  script: |
+    #!/bin/sh
+    sed -i 's/host.lima.internal.*/host.lima.internal host.docker.internal/' /etc/hosts
+    grep -qxF '127.0.0.1 lima-docker' /etc/hosts || echo '127.0.0.1 lima-docker' >> /etc/hosts
+- mode: system
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    command -v docker >/dev/null 2>&1 && exit 0
+    export DEBIAN_FRONTEND=noninteractive
+    curl -fsSL https://get.docker.com | sh
+    # install binfmt
+    # apt install qemu binfmt-support qemu-user-static
+    # docker run --privileged --rm tonistiigi/binfmt --install all
+- mode: system
+  script: |
+    # hack to make ssh port forward able to access docker
+    chmod 777 /var/run/docker.sock
+- mode: system
+  script: |
+    # hit max FDs sometimes with KIND
+    sysctl fs.inotify.max_user_instances=1280
+    sysctl fs.inotify.max_user_watches=655360
+- mode: system
+  script: |
+    #!/bin/sh
+    set -e
+
+    # needed for cilium
+    mount bpffs -t bpf /sys/fs/bpf
+    mount --make-shared /sys/fs/bpf
+    mount --make-shared /sys/fs/cgroup
+- mode: system
+  script: |
+    # for kitty terminal
+    echo 'Defaults env_keep += "TERM TERMINFO"' > /etc/sudoers.d/preserve-terminfo
+- mode: system
+  script: |
+    apt-get update
+    apt-get install -y apt-transport-https ca-certificates curl
+
+    # kubernetes key and repo
+    curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.28/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+    echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.28/deb/ /" | sudo tee /etc/apt/sources.list.d/kubernetes.list
+
+    # helm key and report
+    curl https://baltocdn.com/helm/signing.asc | gpg --dearmor | sudo tee /usr/share/keyrings/helm.gpg > /dev/null
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/helm.gpg] https://baltocdn.com/helm/stable/debian/ all main" | sudo tee /etc/apt/sources.list.d/helm-stable-debian.list
+
+    # install kubectl and helm
+    apt-get update
+    apt-get install -y kubectl helm
+
+    # install KIND
+    curl -fsSLo ./kind https://kind.sigs.k8s.io/dl/v0.22.0/kind-linux-$(dpkg --print-architecture)
+    chmod +x ./kind
+    mv ./kind /usr/local/bin/kind
+
+- mode: system
+  script: |
+    # Own the home
+    chown jarnor /home/jarnor.linux
+    mkdir -p /home/jarnor.linux/go || true
+    chown jarnor /home/jarnor.linux/go
+    chown jarnor /home/jarnor.linux/go/*
+    # cilium dev deps
+    if [[ -f /.cilium-setup ]]; then
+      exit 0
+    fi
+    
+    wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+    apt-add-repository -y "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-17 main"
+    apt-get update
+    apt-get install -y build-essential make libtinfo5 clang-17 jq
+
+    ln -s /usr/bin/clang-17 /usr/bin/clang
+    ln -s /usr/bin/llc-17 /usr/bin/llc
+
+    cd /tmp
+    wget https://go.dev/dl/go1.22.2.linux-arm64.tar.gz
+    rm -rf /usr/local/go && tar -C /usr/local -xzf go1.22.2.linux-arm64.tar.gz
+
+    echo 'export PATH=$PATH:/usr/local/go/bin' >> /home/jarnor.linux/.bashrc
+
+    export PATH=$PATH:/usr/local/go/bin
+    go install github.com/mattn/goveralls@a36c7ef8f23b2952fa6e39663f52107dfc8ad69d
+    go install github.com/mfridman/tparse@28967170dce4f9f13de77ec857f7aed4c4294a5f
+
+    touch /.cilium-setup
+
+probes:
+- script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    if ! timeout 30s bash -c "until command -v docker >/dev/null 2>&1; do sleep 3; done"; then
+      echo >&2 "docker is not installed yet"
+      exit 1
+    fi
+  hint: See "/var/log/cloud-init-output.log". in the guest
+hostResolver:
+  hosts:
+    host.docker.internal: host.lima.internal
+    lima-docker: 127.0.0.1
+portForwards:
+- guestPort: 443
+- guestPort: 80
+- guestSocket: "/var/run/docker.sock"
+  hostSocket: "{{.Dir}}/sock/docker.sock"
+message: |
+  To run `docker` on the host (assumes docker-cli is installed), run the following commands:
+  ------
+  docker context create lima --docker "host=unix://{{.Dir}}/sock/docker.sock"
+  docker context use lima
+  docker run hello-world
+  export KUBECONFIG="{{.Dir}}/kind-kubeconfig.yaml"
+  kind get kubeconfig > $KUBECONFIG
+  ------
